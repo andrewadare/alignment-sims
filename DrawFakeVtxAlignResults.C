@@ -52,8 +52,8 @@ void DrawFakeVtxAlignResults()
     for (int ldr=0; ldr<nl; ldr++)
     {
       cs->cd(ldr+1);
-      hs[lyr][ldr][1]->Draw("");
-      hs[lyr][ldr][0]->Draw("same");
+      hs[lyr][ldr][0]->Draw("");
+      hs[lyr][ldr][1]->Draw("same");
       hs[lyr][ldr][2]->Draw("same");
       gPad->SetBottomMargin(0.15);
       gPad->SetLeftMargin(0.2);
@@ -68,8 +68,8 @@ void DrawFakeVtxAlignResults()
 
 
       cz->cd(ldr+1);
-      hz[lyr][ldr][1]->Draw("");
-      hz[lyr][ldr][0]->Draw("same");
+      hz[lyr][ldr][0]->Draw("");
+      hz[lyr][ldr][1]->Draw("same");
       hz[lyr][ldr][2]->Draw("same");
       gPad->SetBottomMargin(0.15);
       gPad->SetLeftMargin(0.2);
@@ -155,11 +155,12 @@ Resid(int lyr, int ldr, int stage, TNtuple *t, const char *var, const double xma
     h->SetLineColor(kGreen+3);
     if (stage==0)
     {
-      h->SetLineStyle(kDashed);
+      h->SetLineColor(kGray+1);
+      h->SetFillColor(kGray);
     }
     if (stage==1)
     {
-      h->SetLineColor(kGray);
+      h->SetLineStyle(kDashed);
     }
     if (stage==2)
     {
@@ -173,11 +174,12 @@ Resid(int lyr, int ldr, int stage, TNtuple *t, const char *var, const double xma
     h->SetLineColor(kAzure+2);
     if (stage==0)
     {
-      h->SetLineStyle(kDashed);
+      h->SetLineColor(kGray+1);
+      h->SetFillColor(kGray);
     }
     if (stage==1)
     {
-      h->SetLineColor(kGray);
+      h->SetLineStyle(kDashed);
     }
     if (stage==2)
     {
