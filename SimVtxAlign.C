@@ -32,25 +32,29 @@
 using namespace std;
 
 typedef vector<double> vecd;
+typedef vector<string> vecs;
 typedef vector<SvxGeoTrack> geoTracks;
 
 // Globals
 const double BField = 0.0;
-const int nTracks   = (int)1e5;
-const char *pedeInputFile = "vtx-pede-input.bin";
-const char *pedeSteerFile = "vtx-pede-steer.txt";
-const char *pedeConstFile = "vtx-pede-const.txt";
+const int nStdTracks = (int)1e5;
+const int nCntTracks = (int)0.01e5;
+const char *pedeSteerFile = "pede-steer.txt";
+const char *pedeConstFile = "pede-const.txt";
+string pedeBinFileStd = "standalone.bin";
+string pedeBinFileCnt = "svxcnttrks.bin";
 
-void GenTrack(SvxTGeo *geo, const double BField, SvxGeoTrack &t);
+void GenTrack(SvxTGeo *geo, const double B, SvxGeoTrack &t);
 void AddHitNoise(SvxGeoTrack &t, double xsigma, double zsigma);
-void TrackLoop(geoTracks &tracks, TNtuple *hitTree = 0, TNtuple *trkTree = 0);
+void TrackLoop(string binfile, geoTracks &tracks, TNtuple *hitTree = 0, TNtuple *trkTree = 0, TString opt = "");
 bool TrackOk(SvxGeoTrack &t);
-void WriteConstFile(const char *filename, SvxTGeo *geo);
-void WriteSteerFile(const char *filename, const char *binfile, const char *constfile);
+void WriteConstFile(const char *filename, SvxTGeo *geo, TString opt = "");
+void WriteSteerFile(const char *filename, vecs &binfiles, vecs &constfile);
 int Label(int layer, int ladder, string coord);
 void ParInfo(int label, int &layer, int &ladder, string &coord);
 void GetLadderXYZ(SvxTGeo *tgeo, vecd &x, vecd &y, vecd &z);
 int GetCorrections(const char *resFile, std::map<int, double> &mpc);
+void UpdateResiduals(SvxGeoTrack &track);
 
 // Call DrawDiffs() after DrawXY()
 TCanvas *DrawXY(SvxTGeo *geo, const char *name, const char *title, TString opt);
@@ -61,7 +65,7 @@ void DrawDiffs(vecd &x1, vecd &y1, vecd &z1, vecd &x2, vecd &y2, vecd &z2);
 
 
 
-void SimVtxAlign(int iter = 1)
+void SimVtxAlign(int iter = 0)
 {
   // No point in continuing if Millepede II is not installed...
   if (TString(gSystem->GetFromPipe("which pede")).IsNull())
@@ -76,8 +80,18 @@ void SimVtxAlign(int iter = 1)
   TString inFileName  = Form("rootfiles/vtx-fake.%d.root", iter - 1);
   TString outFileName = Form("rootfiles/vtx-fake.%d.root", iter);
 
+  vecs constfiles;
+  vecs binfiles;
 
-  TFile *inFile = 0;
+  if (nStdTracks > 0)
+    binfiles.push_back(pedeBinFileStd);
+  if (nCntTracks > 0)
+  {
+    binfiles.push_back(pedeBinFileCnt);
+  }
+  constfiles.push_back(pedeConstFile);
+
+
   TFile *outFile = new TFile(outFileName.Data(), "recreate");
   const char *hitvars = "layer:ladder:sensor:xs:ys:zs:x:y:z:"
                         "xsigma:zsigma:dz:ds:trkid";
@@ -96,19 +110,20 @@ void SimVtxAlign(int iter = 1)
   tgeo->AddSensors();
 
   TGeoManager *mgr = tgeo->GeoManager();
-  TGeoVolume *top = mgr->GetTopVolume();
   mgr->CloseGeometry();
 
-  WriteConstFile(pedeConstFile, tgeo);
-  WriteSteerFile(pedeSteerFile, pedeInputFile, pedeConstFile);
+  //WriteConstFile(pedeConstFile, tgeo, "");
+  WriteConstFile(pedeConstFile, tgeo, "empty");
+  WriteSteerFile(pedeSteerFile, binfiles, constfiles);
 
   // Original ladder positions
   vecd x0; vecd y0; vecd z0;
   GetLadderXYZ(tgeo, x0, y0, z0);
 
-  Printf("Generating %d tracks...", nTracks);
+  Printf("Generating %d standalone tracks...", nStdTracks);
   geoTracks tracks;
-  while ((int)tracks.size() < nTracks)
+  geoTracks cnttracks;
+  while ((int)tracks.size() < nStdTracks)
   {
     // Generate a new track
     SvxGeoTrack track;
@@ -124,6 +139,23 @@ void SimVtxAlign(int iter = 1)
 
   }
 
+
+  Printf("Generating %d \"central\" tracks...", nCntTracks);
+  while ((int)cnttracks.size() < nCntTracks)
+  {
+    // Generate a new track
+    SvxGeoTrack track;
+    GenTrack(tgeo, BField, track);
+    AddHitNoise(track, 50e-4, 80e-4);
+
+    // Ensure track has four hits, one per layer.
+    if (TrackOk(track))
+    {
+      cnttracks.push_back(track);
+      FillHitNTuple(track, ht0);
+    }
+  }
+
   if (iter==0)
   {
     // Misalignment: move B2L3 by +1 mm in z
@@ -133,13 +165,19 @@ void SimVtxAlign(int iter = 1)
     // Local hit positions (x,z on sensor) remain unchanged.
     for (unsigned int i=0; i<tracks.size(); i++)
       tracks[i].UpdateHits();
+    for (unsigned int i=0; i<cnttracks.size(); i++)
+      cnttracks[i].UpdateHits();
   }
 
   // Record ladder positions after applied misalignment
   vecd x1; vecd y1; vecd z1;
   GetLadderXYZ(tgeo, x1, y1, z1);
 
-  TrackLoop(tracks, ht1, trktree);
+  if (nStdTracks > 0)
+    TrackLoop(pedeBinFileStd, tracks,    ht1, trktree, "fit"); // Fit standalone tracks
+
+  if (nCntTracks > 0)
+    TrackLoop(pedeBinFileCnt, cnttracks, ht1, trktree, ""); // Don't fit SvxCnt tracks
 
   // Shell out to pede executable
   gSystem->Exec(Form("pede %s", pedeSteerFile));
@@ -160,6 +198,8 @@ void SimVtxAlign(int iter = 1)
 
   for (unsigned int i=0; i<tracks.size(); i++)
     tracks[i].UpdateHits();
+  for (unsigned int i=0; i<cnttracks.size(); i++)
+    cnttracks[i].UpdateHits();
 
   // Record positions after alignment
   vecd x2; vecd y2; vecd z2;
@@ -171,6 +211,11 @@ void SimVtxAlign(int iter = 1)
     double pars[4] = {0}; /* y0, z0, phi, theta */
     ZeroFieldResiduals(tracks[i], pars);
     FillHitNTuple(tracks[i], ht2);
+  }
+  for (unsigned int i=0; i<cnttracks.size(); i++)
+  {
+    UpdateResiduals(cnttracks[i]);
+    FillHitNTuple(cnttracks[i], ht2);
   }
 
   // Draw changes in ladder positions
@@ -188,6 +233,7 @@ void SimVtxAlign(int iter = 1)
   tgeo->WriteParFile(pisaFileOut.Data());
 
   Printf("Writing %s", outFileName.Data());
+  outFile->cd();
   ht0->Write("ht0");
   ht1->Write("ht1");
   ht2->Write("ht2");
@@ -216,7 +262,7 @@ TrackOk(SvxGeoTrack &t)
 }
 
 void
-GenTrack(SvxTGeo *geo, const double BField, SvxGeoTrack &t)
+GenTrack(SvxTGeo *geo, const double B, SvxGeoTrack &t)
 {
   static TRandom3 ran3;
   SvxProj proj;
@@ -225,13 +271,13 @@ GenTrack(SvxTGeo *geo, const double BField, SvxGeoTrack &t)
 
   t.nhits  = 0;
   t.charge = 0;
-  t.vx     = 0.; //0.01*ran3.Gaus();
-  t.vy     = 0.; //0.01*ran3.Gaus();
-  t.vz     = 0.; //0.05*ran3.Gaus();
+  t.vx     = 0.0;//0.01*ran3.Gaus();
+  t.vy     = 0.0;//0.01*ran3.Gaus();
+  t.vz     = 0.0*ran3.Gaus();
   t.mom    = ran3.Uniform(0.5, 5.0);
   t.phi0   = ran3.Uniform(0,TMath::TwoPi());
   t.the0   = ran3.Uniform(TMath::PiOver4(), 3*TMath::PiOver4());
-  t.bfield = BField;
+  t.bfield = B;
 
   if (false)
     Printf("Initialized track at (vx,vy,vz) %.2f,%.2f,%.2f with "
@@ -281,15 +327,25 @@ AddHitNoise(SvxGeoTrack &t, double xsigma, double zsigma)
 }
 
 void
-TrackLoop(geoTracks &tracks, TNtuple *hitTree, TNtuple *trkTree)
+TrackLoop(string binfile, geoTracks &tracks, TNtuple *hitTree, TNtuple *trkTree, TString opt)
 {
   Printf("Track loop: fit, compute residuals, write to file...");
-  Mille m(pedeInputFile);
-  for (unsigned int i=0; i<nTracks; i++)
+  Mille m(binfile.c_str());
+  for (unsigned int i=0; i<tracks.size(); i++)
   {
     // Perform straight-line fit --> residuals, track parameters
     double pars[4] = {0}; /* y0, z0, phi, theta */
-    ZeroFieldResiduals(tracks[i], pars);
+
+    if (opt.Contains("fit"))
+      ZeroFieldResiduals(tracks[i], pars);
+    else
+    {
+      pars[0] = tracks[i].vy;
+      pars[1] = tracks[i].vz;
+      pars[2] = tracks[i].phi0;
+      pars[3] = tracks[i].the0;
+      UpdateResiduals(tracks[i]);
+    }
 
     if (hitTree)
       FillHitNTuple(tracks[i], hitTree);
@@ -305,25 +361,49 @@ TrackLoop(geoTracks &tracks, TNtuple *hitTree, TNtuple *trkTree)
     }
 
     // Hit loop
-    float dergl[1] = {1.0}; // Global derivatives
     int slabel[1] = {0};
     int zlabel[1] = {0};
+    float derlc[1] = {1.0}; // Local derivatives
+    float dergl[1] = {1.0}; // Global derivatives
     float sigma_s[4] = {32e-4, 39e-4, 42e-4, 25e-4};
     float sigma_z[4] = {52e-4, 63e-4, 66e-4, 40e-4};
+
     for (int j=0; j<tracks[i].nhits; j++)
     {
       SvxGeoHit hit = tracks[i].GetHit(j);
-      float r = hit.x*hit.x + hit.y*hit.y;
-      float sderlc[4] = {1.0,   r, 0.0, 0.0}; // Local derivatives
-      float zderlc[4] = {0.0, 0.0, 1.0,   r}; // Local derivatives
-      // float derlc[2] = {1.0, r}; // Local derivatives
       slabel[0] = Label(hit.layer, hit.ladder, "s");
       zlabel[0] = Label(hit.layer, hit.ladder, "z");
 
-      m.mille(4, sderlc, 1, dergl, slabel, hit.ds, sigma_s[j]);
-      m.mille(4, zderlc, 1, dergl, zlabel, hit.dz, sigma_z[j]);
+      if (opt.Contains("fit"))
+      {
+        // if (i<1000) Printf("ds %f dz %f", hit.ds, hit.dz);
+        float r = hit.x*hit.x + hit.y*hit.y;
+        float sderlc[4] = {1.0,   r, 0.0, 0.0};
+        float zderlc[4] = {0.0, 0.0, 1.0,   r};
+        m.mille(4, sderlc, 1, dergl, slabel, hit.ds, sigma_s[j]);
+        m.mille(4, zderlc, 1, dergl, zlabel, hit.dz, sigma_z[j]);
+      }
+      else
+      {
+        static int cnt = 0;
+        if (cnt < 10)
+        {
+          Printf("CNT: %d ds %f dz %f : %f %f %f ",
+                 slabel[0], hit.ds, hit.dz,
+                 derlc[0], dergl[0], sigma_s[j]
+                );
+          cnt ++;
+        }
+        m.mille(1, derlc, 1, dergl, slabel, hit.ds, sigma_s[j]);
+        m.mille(1, derlc, 0, dergl, slabel, 0, .000001);
+        m.end(); // Write residuals for this track & reset for next one
+        m.mille(1, derlc, 1, dergl, zlabel, hit.dz, sigma_z[j]);
+        m.mille(1, derlc, 0, dergl, slabel, 0, .000001);
+        m.end(); // Write residuals for this track & reset for next one
+      }
     }
-    m.end(); // Write residuals for this track & reset for next one
+    if (opt.Contains("fit"))
+      m.end(); // Write residuals for this track & reset for next one
   }
 
   // Mille object must go out of scope for output file to close properly.
@@ -331,10 +411,16 @@ TrackLoop(geoTracks &tracks, TNtuple *hitTree, TNtuple *trkTree)
 }
 
 void
-WriteConstFile(const char *filename, SvxTGeo *geo)
+WriteConstFile(const char *filename, SvxTGeo *geo, TString opt)
 {
   Printf("Writing %s", filename);
   ofstream fs(filename);
+
+  if (opt.Contains("empty"))
+  {
+    fs.close();
+    return;
+  }
 
   // Write linear constraints such that \sum_label w_label * p_label = c
   // where w is the weight to be applied for each term.
@@ -348,7 +434,10 @@ WriteConstFile(const char *filename, SvxTGeo *geo)
   // Parameter
   // 104 0.0 -1 !
 
-  // Translation constraints for W then E arm
+  // -----------------------------------------------------------------------
+  // ----------------------------- z constraints ---------------------------
+  // -----------------------------------------------------------------------
+  // z global translation constraint for W then E arm
   fs << "Constraint 0.0" << endl;
   for (int lyr=0; lyr<geo->GetNLayers(); lyr++)
     for (int ldr=0; ldr<geo->GetNLadders(lyr)/2; ldr++)
@@ -366,7 +455,7 @@ WriteConstFile(const char *filename, SvxTGeo *geo)
       fs << label << " " << val << endl;
     }
 
-  // Shear constraints for W then E arm
+  // z radial shear constraint for W then E arm
   fs << "Constraint 0.0" << endl;
   for (int lyr=0; lyr<geo->GetNLayers(); lyr++)
     for (int ldr=0; ldr<geo->GetNLadders(lyr)/2; ldr++)
@@ -385,36 +474,38 @@ WriteConstFile(const char *filename, SvxTGeo *geo)
       fs << label << " " << val << endl;
     }
 
-  // // Phi sum constraints for W then E arm
-  // fs << "Constraint 0.0" << endl;
-  // for (int lyr=0; lyr<geo->GetNLayers(); lyr++)
-  //   for (int ldr=0; ldr<geo->GetNLadders(lyr)/2; ldr++)
-  //   {
-  //     int label = Label(lyr, ldr, "z");
-  //     float val = TMath::PiOver2() + fmod(geo->SensorPhiRad(lyr, ldr, 0), TMath::TwoPi());
-  //     if (label==104)
-  //       val = 0;
-  //     fs << label << " " << val << endl;
-  //   }
-
-  // fs << "Constraint 0.0" << endl;
-  // for (int lyr=0; lyr<geo->GetNLayers(); lyr++)
-  //   for (int ldr=geo->GetNLadders(lyr)/2; ldr < geo->GetNLadders(lyr); ldr++)
-  //   {
-  //     int label = Label(lyr, ldr, "z");
-  //     float val = TMath::PiOver2() + fmod(geo->SensorPhiRad(lyr, ldr, 0), TMath::TwoPi());
-  //     if (label==104)
-  //       val = 0;
-  //     fs << label << " " << val << endl;
-  //   }
-
-  // r*phi sum constraints for W then E arm
+  // z azimuthal shear constraint for W then E arm
   fs << "Constraint 0.0" << endl;
   for (int lyr=0; lyr<geo->GetNLayers(); lyr++)
     for (int ldr=0; ldr<geo->GetNLadders(lyr)/2; ldr++)
     {
       int label = Label(lyr, ldr, "z");
-      float val = TMath::PiOver2() + fmod(geo->SensorPhiRad(lyr, ldr, 0), TMath::TwoPi());
+      float val = TMath::PiOver2() + fmod(geo->SensorPhiRad(lyr, ldr, 0),
+                                          TMath::TwoPi());
+      if (label==104)
+        val = 0;
+      fs << label << " " << val << endl;
+    }
+  fs << "Constraint 0.0" << endl;
+  for (int lyr=0; lyr<geo->GetNLayers(); lyr++)
+    for (int ldr=geo->GetNLadders(lyr)/2; ldr < geo->GetNLadders(lyr); ldr++)
+    {
+      int label = Label(lyr, ldr, "z");
+      float val = TMath::PiOver2() + fmod(geo->SensorPhiRad(lyr, ldr, 0),
+                                          TMath::TwoPi());
+      if (label==104)
+        val = 0;
+      fs << label << " " << val << endl;
+    }
+
+  // z rotation (r*phi) constraint for W then E arm
+  fs << "Constraint 0.0" << endl;
+  for (int lyr=0; lyr<geo->GetNLayers(); lyr++)
+    for (int ldr=0; ldr<geo->GetNLadders(lyr)/2; ldr++)
+    {
+      int label = Label(lyr, ldr, "z");
+      float val = TMath::PiOver2() + fmod(geo->SensorPhiRad(lyr, ldr, 0),
+                                          TMath::TwoPi());
       val *= geo->SensorRadius(lyr, ldr, 0);
       if (label==104)
         val = 0;
@@ -425,20 +516,92 @@ WriteConstFile(const char *filename, SvxTGeo *geo)
     for (int ldr=geo->GetNLadders(lyr)/2; ldr < geo->GetNLadders(lyr); ldr++)
     {
       int label = Label(lyr, ldr, "z");
-      float val = TMath::PiOver2() + fmod(geo->SensorPhiRad(lyr, ldr, 0), TMath::TwoPi());
+      float val = TMath::PiOver2() + fmod(geo->SensorPhiRad(lyr, ldr, 0),
+                                          TMath::TwoPi());
       val *= geo->SensorRadius(lyr, ldr, 0);
       if (label==104)
         val = 0;
       fs << label << " " << val << endl;
     }
 
-  // r*phi sum constraints for W then E arm
+
+
+
+  // -----------------------------------------------------------------------
+  // ----------------------------- s = rphi constraints --------------------
+  // -----------------------------------------------------------------------
+
+
+
+  // s global translation constraint for W then E arm
   fs << "Constraint 0.0" << endl;
   for (int lyr=0; lyr<geo->GetNLayers(); lyr++)
     for (int ldr=0; ldr<geo->GetNLadders(lyr)/2; ldr++)
     {
       int label = Label(lyr, ldr, "s");
-      float val = TMath::PiOver2() + fmod(geo->SensorPhiRad(lyr, ldr, 0), TMath::TwoPi());
+      float val = label==104 ? 0.0 : 1.0;
+      fs << label << " " << val << endl;
+    }
+  fs << "Constraint 0.0" << endl;
+  for (int lyr=0; lyr<geo->GetNLayers(); lyr++)
+    for (int ldr=geo->GetNLadders(lyr)/2; ldr < geo->GetNLadders(lyr); ldr++)
+    {
+      int label = Label(lyr, ldr, "s");
+      float val = label==104 ? 0.0 : 1.0;
+      fs << label << " " << val << endl;
+    }
+
+  // s radial shear constraint for W then E arm
+  fs << "Constraint 0.0" << endl;
+  for (int lyr=0; lyr<geo->GetNLayers(); lyr++)
+    for (int ldr=0; ldr<geo->GetNLadders(lyr)/2; ldr++)
+    {
+      int label = Label(lyr, ldr, "s");
+      float val = label==104 ? 0.0 : geo->SensorRadius(lyr, ldr, 0);
+      fs << label << " " << val << endl;
+    }
+  fs << "Constraint 0.0" << endl;
+  for (int lyr=0; lyr<geo->GetNLayers(); lyr++)
+    for (int ldr=geo->GetNLadders(lyr)/2; ldr < geo->GetNLadders(lyr); ldr++)
+    {
+      int label = Label(lyr, ldr, "s");
+      // float val = geo->SensorRadius(lyr, ldr, 0);
+      float val = label==104 ? 0.0 : geo->SensorRadius(lyr, ldr, 0);
+      fs << label << " " << val << endl;
+    }
+
+  // s azimuthal shear constraint for W then E arm
+  fs << "Constraint 0.0" << endl;
+  for (int lyr=0; lyr<geo->GetNLayers(); lyr++)
+    for (int ldr=0; ldr<geo->GetNLadders(lyr)/2; ldr++)
+    {
+      int label = Label(lyr, ldr, "s");
+      float val = TMath::PiOver2() + fmod(geo->SensorPhiRad(lyr, ldr, 0),
+                                          TMath::TwoPi());
+      if (label==104)
+        val = 0;
+      fs << label << " " << val << endl;
+    }
+  fs << "Constraint 0.0" << endl;
+  for (int lyr=0; lyr<geo->GetNLayers(); lyr++)
+    for (int ldr=geo->GetNLadders(lyr)/2; ldr < geo->GetNLadders(lyr); ldr++)
+    {
+      int label = Label(lyr, ldr, "s");
+      float val = TMath::PiOver2() + fmod(geo->SensorPhiRad(lyr, ldr, 0),
+                                          TMath::TwoPi());
+      if (label==104)
+        val = 0;
+      fs << label << " " << val << endl;
+    }
+
+  // s rotation (r*phi) constraint for W then E arm
+  fs << "Constraint 0.0" << endl;
+  for (int lyr=0; lyr<geo->GetNLayers(); lyr++)
+    for (int ldr=0; ldr<geo->GetNLadders(lyr)/2; ldr++)
+    {
+      int label = Label(lyr, ldr, "s");
+      float val = TMath::PiOver2() + fmod(geo->SensorPhiRad(lyr, ldr, 0),
+                                          TMath::TwoPi());
       val *= geo->SensorRadius(lyr, ldr, 0);
       if (label==104)
         val = 0;
@@ -449,12 +612,15 @@ WriteConstFile(const char *filename, SvxTGeo *geo)
     for (int ldr=geo->GetNLadders(lyr)/2; ldr < geo->GetNLadders(lyr); ldr++)
     {
       int label = Label(lyr, ldr, "s");
-      float val = TMath::PiOver2() + fmod(geo->SensorPhiRad(lyr, ldr, 0), TMath::TwoPi());
+      float val = TMath::PiOver2() + fmod(geo->SensorPhiRad(lyr, ldr, 0),
+                                          TMath::TwoPi());
       val *= geo->SensorRadius(lyr, ldr, 0);
       if (label==104)
         val = 0;
       fs << label << " " << val << endl;
     }
+
+
 
   fs.close();
   Printf("Done.");
@@ -462,7 +628,7 @@ WriteConstFile(const char *filename, SvxTGeo *geo)
 }
 
 void
-WriteSteerFile(const char *filename, const char *binfile, const char *constfile)
+WriteSteerFile(const char *filename, vecs &binfiles, vecs &constfiles)
 {
   Printf("Writing %s", filename);
 
@@ -473,14 +639,16 @@ WriteSteerFile(const char *filename, const char *binfile, const char *constfile)
   fs << endl;
 
   fs << "Fortranfiles  ! Fortran/text inputs listed here:" << endl;
-  fs << Form("%s  ! constraints text file", constfile) << endl;
+  for (unsigned int i=0; i<constfiles.size(); i++)
+    fs << constfiles[i] << " ! constraints file" << endl;
   fs << endl;
 
   fs << "Cfiles  ! c/c++ binary input files listed here:" << endl;
-  fs << Form("%s  ! binary data file", binfile) << endl;
+  for (unsigned int i=0; i<binfiles.size(); i++)
+    fs << binfiles[i] << " ! binary data file" << endl;
   fs << endl;
 
-  fs << "method inversion 3 0.001  ! Gauss. elim., #iterations, tol." << endl;
+  fs << "method inversion 10 0.0001  ! Gauss. elim., #iterations, tol." << endl;
   fs << "end" << endl;
 
   fs.close();
@@ -668,4 +836,27 @@ GetCorrections(const char *resFile, std::map<int, double> &mpc)
     }
 
   return (int)mpc.size();
+}
+
+void
+UpdateResiduals(SvxGeoTrack &track)
+{
+  static TRandom3 ran;
+
+  for (int i=0; i<track.nhits; i++)
+  {
+    SvxGeoHit hit = track.GetHit(i);
+    double r = TMath::Sqrt(hit.x*hit.x + hit.y*hit.y);
+    double xproj = track.vx + r*TMath::Cos(track.phi0);
+    double yproj = track.vy + r*TMath::Sin(track.phi0);
+    double zproj = track.vz + r/TMath::Tan(track.the0);
+
+    double phiproj = TMath::ATan2(yproj, xproj);
+    double phihit = TMath::ATan2(hit.y, hit.x);
+
+    track.hits[i].dz = zproj - hit.z ;
+    track.hits[i].ds = r*fmod(phiproj - phihit, TMath::TwoPi()) ;
+  }
+
+  return;
 }
